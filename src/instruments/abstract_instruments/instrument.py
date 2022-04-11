@@ -594,7 +594,8 @@ class Instrument:
         """
         conn = socket.socket()
         conn.connect((host, port))
-        return cls(GPIBCommunicator(conn, gpib_address, model))
+        comm = SocketCommunicator(conn)
+        return cls(GPIBCommunicator(comm, gpib_address, model))
 
     @classmethod
     def open_visa(cls, resource_name):
