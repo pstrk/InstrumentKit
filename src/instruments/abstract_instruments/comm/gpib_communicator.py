@@ -35,19 +35,25 @@ class GPIBCommunicator(io.IOBase, AbstractCommunicator):
         self._model = self.Model(model)
         self._file = filelike
         self._gpib_address = gpib_address
-        self._file.terminator = "\r"
+        self._file.terminator = "\r"  # Ethernet/Network terminator
+        self._network_terminator = self._file.terminator
+
         if self._model == GPIBCommunicator.Model.gi:
             self._version = int(self._file.query("+ver"))
         if self._model == GPIBCommunicator.Model.pl:
-            self._file.sendcmd("++auto 0")
+            self._file.sendcmd("++mode 1")  # set device to controller mode
+            self._file.sendcmd("++auto 0")  # disable read after write
         self._terminator = None
-        self.terminator = "\n"
+        self.terminator = "\n"  # GPIB terminator
         self._eoi = True
         self._timeout = 1000 * u.millisecond
         if self._model == GPIBCommunicator.Model.gi and self._version <= 4:
             self._eos = 10
         else:
             self._eos = "\n"
+
+        self._sleeptime = None
+        self.sleeptime = 0.01
 
     # ENUMS #
 
@@ -62,6 +68,20 @@ class GPIBCommunicator(io.IOBase, AbstractCommunicator):
         pl = "pl"
 
     # PROPERTIES #
+    @property
+    def sleeptime(self):
+        """
+        Gets/Sets the sleep time after sending a command to the Ethernet adapter.
+        """
+        return self._sleeptime
+
+    @sleeptime.setter
+    def sleeptime(self, newval):
+        newval = assume_units(newval, u.second)
+        if newval.magnitude >= 0 and newval.magnitude <= 10:
+            self._sleeptime = newval.magnitude
+        else:
+            raise (ValueError("Sleep time should be set between 0 and 10 seconds."))
 
     @property
     def address(self):
@@ -262,7 +282,10 @@ class GPIBCommunicator(io.IOBase, AbstractCommunicator):
         :return: The read bytes from the connection
         :rtype: `bytes`
         """
-        return self._file.read_raw(size)
+        self._initread(size)
+        response = self._file.read_raw(size)
+        self._endread()
+        return response
 
     def read(self, size=-1, encoding="utf-8"):
         """
@@ -281,7 +304,10 @@ class GPIBCommunicator(io.IOBase, AbstractCommunicator):
         :return: Data read from the GPIB adapter
         :rtype: `str`
         """
-        return self._file.read(size, encoding)
+        self._initread(size)
+        response = self._file.read(size, encoding)
+        self._endread()
+        return response
 
     def write_raw(self, msg):
         """
@@ -311,6 +337,41 @@ class GPIBCommunicator(io.IOBase, AbstractCommunicator):
 
     # METHODS #
 
+    def _initread(self, size):
+        """
+        This method must be called before data is read from an instrument. It communicates with the GPIB adapaters to
+        initialize the read process and configures the GPIB terminator.
+        """
+        if self._model == GPIBCommunicator.Model.gi and "?" not in msg:
+            self._file.sendcmd("+read")
+        if self._model == GPIBCommunicator.Model.pl:
+            if size == -1:
+                if self.terminator == "eoi":
+                    self._file.sendcmd(
+                        "++eot_char %i" % ord(self._file.terminator)
+                    )  # Add the network terminator if EOI is used
+                    self._file.sendcmd("++eot_enable 1")
+                    self.sendcmd("++read eoi")  # Read until eoi
+                else:
+                    self._file.terminator = (
+                        self.terminator
+                    )  # set the file like terminator to be equal to the GPIB terminator. This must be restored after reading.
+                    self._file.sendcmd(
+                        "++eot_enable 0"
+                    )  # disable the file like terminator if a character terminator is used
+                    self.sendcmd("++read %i" % ord(self.terminator))
+            else:
+                self.sendcmd("++read")  # Read until timeout
+                time.sleep(self._sleeptime)
+
+    def _endread(self):
+        """
+        This method must be called after data was read from an instrument.
+        """
+        if self._model == GPIBCommunicator.Model.pl:
+            if self.terminator != "eoi":
+                self._file.terminator = self._network_terminator
+
     def _sendcmd(self, msg):
         """
         This is the implementation of ``sendcmd`` for communicating with
@@ -320,7 +381,6 @@ class GPIBCommunicator(io.IOBase, AbstractCommunicator):
 
         :param str msg: The command message to send to the instrument
         """
-        sleep_time = 0.01
 
         if msg == "":
             return
@@ -328,15 +388,12 @@ class GPIBCommunicator(io.IOBase, AbstractCommunicator):
             self._file.sendcmd(f"+a:{str(self._gpib_address)}")
         else:
             self._file.sendcmd(f"++addr {str(self._gpib_address)}")
-        time.sleep(sleep_time)
+
         self.eoi = self.eoi
-        time.sleep(sleep_time)
         self.timeout = self.timeout
-        time.sleep(sleep_time)
         self.eos = self.eos
-        time.sleep(sleep_time)
         self._file.sendcmd(msg)
-        time.sleep(sleep_time)
+        time.sleep(self._sleeptime)
 
     def _query(self, msg, size=-1):
         """
@@ -361,8 +418,5 @@ class GPIBCommunicator(io.IOBase, AbstractCommunicator):
         :rtype: `str`
         """
         self.sendcmd(msg)
-        if self._model == GPIBCommunicator.Model.gi and "?" not in msg:
-            self._file.sendcmd("+read")
-        if self._model == GPIBCommunicator.Model.pl:
-            self._file.sendcmd("++read")
-        return self._file.read(size).strip()
+        self._initread(size)
+        return self.read(size).strip()
